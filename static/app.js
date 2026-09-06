@@ -11,6 +11,12 @@
 
 const state = {
   status: "idle",
+  // The startup scan publishes groups as it finds them, so "scanning" and
+  // "reviewable" are no longer opposites. streaming says which kind of scan
+  // is running: one appending to the list below (decisions stay live), or a
+  // rescan about to replace it wholesale (decisions locked).
+  streaming: false,
+  progress: null,   // last SSE frame, so the queue rail can show scan progress
   error: null,
   generation: 0,
   params: null,
@@ -74,6 +80,7 @@ function fmtInt(n) {
 async function refreshState() {
   const data = await api("/api/state");
   state.status = data.status;
+  state.streaming = !!data.streaming;
   state.error = data.error;
   state.generation = data.generation;
   state.params = data.params;
@@ -128,8 +135,15 @@ function reviewCounts() {
   return { confirmed, skipped, pending: state.groups.length - confirmed - skipped, total: state.groups.length };
 }
 
+// True when a scan is running but its groups are already reviewable: the
+// startup scan appends as it goes, so once the first group has landed the
+// full-screen progress panel would be hiding work the user can already do.
+function reviewableDuringScan() {
+  return state.streaming && state.groups.length > 0;
+}
+
 function appState() {
-  if (state.status === "scanning") return "scanning";
+  if (state.status === "scanning" && !reviewableDuringScan()) return "scanning";
   if (state.status === "error" && !state.groups.length) return "error";
   if (!state.groups.length) return "empty";
   return state.detail ? "group" : "empty";
@@ -248,7 +262,13 @@ function renderQueue() {
   $("meter-kept").style.width = total ? `${(100 * confirmed) / total}%` : "0";
   $("meter-skipped").style.width = total ? `${(100 * skipped) / total}%` : "0";
   $("queue-meter").setAttribute("aria-label", `${confirmed} kept, ${skipped} skipped, ${pending} left`);
-  $("queue-tally").textContent = total ? `${confirmed} kept · ${skipped} skipped` : "";
+  // While a streaming scan is still running the queue is incomplete, and the
+  // full-screen progress panel is gone as soon as the first group lands --
+  // so the tally line carries the phase readout instead of vanishing.
+  const p = state.progress;
+  $("queue-tally").textContent = state.status === "scanning" && state.streaming
+    ? `Still scanning — ${p && p.total > 0 ? `${fmtInt(p.done)} / ${fmtInt(p.total)}` : "…"}`
+    : (total ? `${confirmed} kept · ${skipped} skipped` : "");
 
   const list = $("queue-list");
   list.innerHTML = "";
@@ -743,7 +763,8 @@ function renderDecision() {
   el.innerHTML = "";
   const d = state.detail;
   if (!d) {
-    if (state.status === "scanning") el.textContent = "Scanning — confirm and skip resume when it finishes.";
+    if (state.status === "scanning" && !state.streaming) el.textContent = "Scanning — confirm and skip resume when it finishes.";
+    else if (state.status === "scanning") el.textContent = "Still scanning — groups appear as they're found, and you can decide them now.";
     else el.textContent = state.groups.length ? "No group selected." : "";
     return;
   }
@@ -796,7 +817,7 @@ function renderDecision() {
 const NO_GROUP_REASON = "Nothing to act on yet — pick a group in the list first.";
 
 function updateActionButtons() {
-  const hasGroup = !!state.detail && state.status !== "scanning";
+  const hasGroup = !!state.detail && (state.status !== "scanning" || state.streaming);
   for (const id of ["btn-confirm", "btn-skip", "btn-open"]) {
     const btn = $(id);
     if (!btn.dataset.enabledTitle) btn.dataset.enabledTitle = btn.title;
@@ -924,7 +945,7 @@ function pick(j) {
   const i = state.activeIndex;
   const d = state.detail;
   if (i < 0 || !d || j < 0 || j >= d.paths.length) return pickChain;
-  if (state.status === "scanning") { showToast("A scan is running — decisions are locked until it finishes."); return pickChain; }
+  if (state.status === "scanning" && !state.streaming) { showToast("A scan is running — decisions are locked until it finishes."); return pickChain; }
   // A pick queued behind an in-flight confirm would race it on the wire and
   // could move files for a candidate the user never saw confirmed.
   if (confirming) { showToast("Confirming — the pick is locked until it lands."); return pickChain; }
@@ -1105,7 +1126,12 @@ async function progressLost(es) {
   }
 }
 
+// Highest group count this stream has reported, so a re-read of /api/state is
+// triggered once per new group rather than on every progress frame.
+let lastSeenGroups = 0;
+
 function connectProgress() {
+  lastSeenGroups = 0;
   if (state.eventSource) state.eventSource.close();
   clearTimeout(progressGraceTimer);
   progressGraceTimer = null;
@@ -1133,8 +1159,26 @@ function connectProgress() {
     let data;
     // A malformed frame is not a dead server -- drop it and keep listening.
     try { data = JSON.parse(ev.data); } catch { return; }
+    state.progress = data;
     renderProgress(data);
-    if (data.status === "scanning") return;
+    if (data.status === "scanning") {
+      // A streaming scan publishes groups as it finds them; the count growing
+      // is the only signal that there is more to show. Re-read state, and
+      // open the first group as soon as one exists so the review can start
+      // without waiting for the scan to end.
+      // Not while a pick or confirm is in flight: refreshState replaces
+      // state.groups wholesale and would briefly undo the optimistic flip.
+      // lastSeenGroups isn't advanced, so the next frame retries in 0.2s.
+      if (data.groups > lastSeenGroups && !confirming && pendingPicks === 0) {
+        lastSeenGroups = data.groups;
+        refreshState()
+          .then(() => (state.detail ? null : loadFirstPending()))
+          .catch(() => { /* the terminal frame will refresh state anyway */ });
+      } else {
+        renderQueue();  // keep the tally's progress readout ticking
+      }
+      return;
+    }
 
     // Must close explicitly: a browser EventSource treats a closed stream as
     // an error and reconnects a few seconds later, which would re-open this

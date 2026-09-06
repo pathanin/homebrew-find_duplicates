@@ -87,6 +87,13 @@ class Session:
     groups: list[Group] = field(default_factory=list)
     manifest: list[dict] = field(default_factory=list)
     status: str = "idle"  # idle | scanning | ready | error
+    # True while a scan is publishing groups into `groups` live rather than
+    # swapping a finished list in at the end (see _launch_scan's `stream`).
+    # Only the startup scan streams: it appends to an empty list and resets
+    # nothing at the end, so an index handed out mid-scan keeps addressing the
+    # same group and the manifest survives. A rescan can't offer that -- its
+    # on_done replaces groups and manifest wholesale -- so it stays blocking.
+    streaming: bool = False
     error: str | None = None
     # Keyed (generation, group, file, max_side): the switcher strip's 800px
     # previews and the stage's 1600px renders of the same file are both cached
@@ -138,18 +145,38 @@ _scan_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scan")
 shutting_down = Event()
 
 
-def _launch_scan(session: Session, params: ScanParams, loop: asyncio.AbstractEventLoop) -> None:
+def _launch_scan(
+    session: Session, params: ScanParams, loop: asyncio.AbstractEventLoop,
+    stream: bool = False,
+) -> None:
     """Runs build_groups() in the default executor (a thread pool) so the
     event loop stays responsive to other requests while a scan is in
     flight, then swaps the result into *session* -- but only on success;
     a failed scan leaves the previous groups/manifest/status untouched
     except for the error message, so a bad rescan (e.g. a typo'd directory)
-    doesn't wipe out a review already in progress."""
+    doesn't wipe out a review already in progress.
+
+    With *stream* (the startup scan only -- see Session.streaming), groups
+    are appended to session.groups as build_groups finishes each one, and
+    on_done swaps nothing: params and generation are set up front instead,
+    and the review can begin on group 1 while the rest of the library is
+    still being analyzed. A stream that fails partway keeps whatever it
+    already published and sets session.error alongside it -- there is no
+    previous state to protect on a startup scan, and half a review beats
+    none. The frontend's error notice renders independently of whether
+    groups exist, so that failure is still visible."""
 
     def progress_cb(label: str, done: int, total: int) -> None:
         with session.progress_lock:
             session.progress = {"label": label, "done": done, "total": total}
             session.progress_seq += 1
+
+    def group_cb(group: Group) -> None:
+        # Runs on the scan executor thread, like progress_cb -- hence the
+        # lock. Append-only by contract (see build_groups' group_callback):
+        # never reorder or replace what's already here.
+        with session.lock:
+            session.groups.append(group)
 
     def run_scan() -> list[Group]:
         # Safe to hand these to the executor thread unlocked: /api/scan
@@ -159,24 +186,38 @@ def _launch_scan(session: Session, params: ScanParams, loop: asyncio.AbstractEve
             params.directory, params.threshold, recursive=params.recursive,
             dest_dir=params.dest_dir, progress_callback=progress_cb,
             hash_cache=session.hash_cache, analyze_cache=session.analyze_cache,
+            group_callback=group_cb if stream else None,
         )
 
     def on_done(fut: "asyncio.Future[list[Group]]") -> None:
         with session.lock:
+            streamed = session.streaming
+            session.streaming = False
             try:
                 groups = fut.result()
             except Exception as exc:  # noqa: BLE001 -- surface any scan failure as session.error
                 session.status = "error"
                 session.error = str(exc)
                 return
-            session.params = params
-            session.groups = groups
-            session.manifest = []
-            session.image_cache = {}
-            session.generation += 1
+            if not streamed:
+                session.params = params
+                session.groups = groups
+                session.manifest = []
+                session.image_cache = {}
+                session.generation += 1
             session.status = "ready"
             session.error = None
 
+    if stream:
+        # Both have to be live before the first group is published: the
+        # client renders against params, and every image URL carries the
+        # generation. Bumped once here rather than in on_done so it stays
+        # stable for the whole streaming scan -- the indices never change
+        # under the client, so nothing needs to be re-fetched at the end.
+        with session.lock:
+            session.params = params
+            session.generation += 1
+            session.streaming = True
     with session.progress_lock:
         session.progress = {"label": "", "done": 0, "total": 0}
         session.progress_seq += 1
@@ -215,8 +256,14 @@ def _require_not_scanning(session: Session) -> None:
     still be real and non-destructive (files land in dest_dir, never
     deleted), but the manifest entry recording it would be wiped by the
     swap, breaking the "manifest reflects filesystem state for the
-    session" invariant unapply relies on. Caller must hold session.lock."""
-    if session.status == "scanning":
+    session" invariant unapply relies on. Caller must hold session.lock.
+
+    A streaming scan is exempt: it only ever appends to session.groups and
+    resets neither groups nor manifest at the end, so none of that applies
+    and reviewing while it runs is the whole point. This guards the
+    pick/confirm/skip routes only -- /api/scan has its own "already
+    running" check, which must keep rejecting a rescan fired mid-stream."""
+    if session.status == "scanning" and not session.streaming:
         raise HTTPException(409, "a scan is in progress; try again once it finishes")
 
 
@@ -298,7 +345,10 @@ def create_app(initial_params: ScanParams, token: str) -> FastAPI:
         # startup scan is still running, with both on_done callbacks racing
         # to swap groups in.
         session.status = "scanning"
-        _launch_scan(session, session.params, asyncio.get_running_loop())
+        # stream=True: only the startup scan can publish groups live, since
+        # it starts from an empty session there's nothing to protect. A
+        # control-panel rescan below stays swap-at-the-end.
+        _launch_scan(session, session.params, asyncio.get_running_loop(), stream=True)
         yield
 
     app = FastAPI(lifespan=lifespan)
@@ -330,6 +380,10 @@ def create_app(initial_params: ScanParams, token: str) -> FastAPI:
         with session.lock:
             return JSONResponse({
                 "status": session.status,
+                # "scanning" alone doesn't say whether the groups below are
+                # reviewable: a streaming scan's are, a rescan's are about to
+                # be replaced. The frontend unlocks decisions off this.
+                "streaming": session.streaming,
                 "error": session.error,
                 "generation": session.generation,
                 "params": {
@@ -526,16 +580,24 @@ def create_app(initial_params: ScanParams, token: str) -> FastAPI:
 
         async def event_gen():
             last_seq = -1
+            last_groups = -1
             while True:
                 if shutting_down.is_set() or await request.is_disconnected():
                     break
                 with session.progress_lock:
                     seq = session.progress_seq
                     progress = dict(session.progress)
+                # Read outside both locks, like status already is: an int and
+                # a list length, and taking session.lock under progress_lock
+                # would be the only nested acquisition in the app.
                 status = session.status
-                if seq != last_seq or status != "scanning":
+                n_groups = len(session.groups)
+                if seq != last_seq or n_groups != last_groups or status != "scanning":
                     last_seq = seq
-                    yield f"data: {json.dumps({'status': status, **progress})}\n\n"
+                    last_groups = n_groups
+                    # groups: a streaming scan publishes as it goes, and this
+                    # count growing is the client's cue to re-read /api/state.
+                    yield f"data: {json.dumps({'status': status, 'groups': n_groups, **progress})}\n\n"
                     if status != "scanning":
                         break
                 await asyncio.sleep(0.2)

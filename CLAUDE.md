@@ -34,6 +34,7 @@ python3 tests/test_recursive_scan.py
 python3 tests/test_scan_progress.py
 python3 tests/test_score_group.py
 python3 tests/test_shutdown.py
+python3 tests/test_streaming_scan.py
 python3 tests/test_unapply_crash_safety.py
 python3 tests/test_vectorized_sweep.py
 python3 tests/test_web_api.py
@@ -59,7 +60,11 @@ Front end is vanilla JS in `static/app.js` (no build step, no framework), organi
 
 ### Scan lifecycle
 
-`_launch_scan` runs `build_groups` on `_scan_executor` (a dedicated 1-worker pool). Progress and completion callbacks fire on that worker thread and marshal back into `Session` under its locks. `session.status` moves `idle → scanning → ready|error`, and the `scanning` status is itself the guard that stops a second concurrent scan.
+`_launch_scan` runs `build_groups` on `_scan_executor` (a dedicated 1-worker pool). Progress, group and completion callbacks fire on that worker thread and marshal back into `Session` under its locks. `session.status` moves `idle → scanning → ready|error`, and the `scanning` status is what stops a second concurrent scan — `/api/scan`'s own check, which is separate from `_require_not_scanning` and must stay that way.
+
+The **startup scan streams** (`_launch_scan(..., stream=True)`, `Session.streaming`): `build_groups`' `group_callback` appends each finished group into the live session, so review begins on group 1 while the rest of the library is still being analyzed. `params` and `generation` are set up front and `on_done` swaps nothing, so an index handed out mid-scan keeps addressing the same group and a mid-scan confirm's manifest entry survives. `_require_not_scanning` is exempt while `streaming` (the pick/confirm/skip routes only). A **rescan never streams** — its `on_done` replaces groups and manifest wholesale, which is exactly what the guard exists to protect. `/api/state`'s `streaming` flag is how the frontend knows a "scanning" status still means the groups below are reviewable.
+
+Publication order is `raw_groups` order, not completion order, and a group is scored, permuted best-first and filtered (`< 2` valid members) *before* it is ever handed out. Both matter: `tests/test_streaming_scan.py` locks them.
 
 ### Grouping is two-stage
 
@@ -83,7 +88,8 @@ Front end is vanilla JS in `static/app.js` (no build step, no framework), organi
 - Any numpy-derived value reaching the JSON API needs an explicit `bool()`/`float()`/`int()` cast **where it's computed**. `numpy.bool_` doesn't subclass `bool` and isn't JSON-serializable (this bit `build_groups`'s `is_close_call`).
 - `compare_image_quality.load_gray` builds one shared **float32** buffer, and the metrics fuse multi-pass numpy into single cv2 calls (`cv2.absdiff`, `cv2.norm(..., NORM_L1)`); `effective_resolution` uses `cv2.dft`, not `np.fft.fft2`. Analyze is the per-image bottleneck — "simplifying" these back to plain numpy halves throughput.
 - `duplicates_web.py` imports core functions **by name**, so a test patching one for a route handler must patch `duplicates_web.X`, not `duplicates_core.X` — the latter silently does nothing. Names called bare inside `duplicates_core.py` (`load_hash_gray`, `ThreadPoolExecutor`) are patched there instead.
-- `Session` is guarded by a plain `threading.Lock`, not `asyncio.Lock`: scan callbacks run on an executor thread, not the event loop. `progress` has its own separate lock so a slow file move can't stall progress updates. Keep the `scanning` guards (`_require_not_scanning`) on the mutating endpoints.
+- `Session` is guarded by a plain `threading.Lock`, not `asyncio.Lock`: scan callbacks run on an executor thread, not the event loop. `progress` has its own separate lock so a slow file move can't stall progress updates. Keep the `scanning` guards (`_require_not_scanning`) on the mutating endpoints — its `streaming` exemption is for the append-only startup scan only, and `/api/scan` must keep its own separate check or a rescan fired mid-stream would run a second `build_groups` over the same caches.
+- `analyze_paths` attaches `file_size` to each result as that result lands, not in one pass at the end — a group published mid-scan has to be complete. The cache-hit branch needs it too, or `/api/group`'s `sizes` KeyErrors on the second scan of any file (`tests/test_streaming_scan.py` covers this).
 - `image_cache` is keyed `(generation, group, file, max_side)`. `max_side` is in the key because the 800px switcher preview and 1600px stage render of the same file would otherwise collide; `generation` is in it because a render runs outside the lock and a rescan finishing mid-render must not drop stale bytes into the fresh cache.
 - `hash_cache`/`analyze_cache` deliberately **survive** a rescan and are never reset — that's what makes the control panel's rescan fast on a large library. Don't "fix" the missing reset.
 - The frontend appends `?g=<generation>` to image URLs because `(i, j)` indices get reused across rescans and the browser's HTTP cache doesn't know that.

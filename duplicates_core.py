@@ -797,7 +797,7 @@ def _analyze_one(path_str: str) -> dict | None:
 
 def analyze_paths(paths: list[Path], cache: dict,
                   precomputed_stats: dict[Path, os.stat_result] | None = None,
-                  progress_callback=None) -> dict[Path, dict]:
+                  progress_callback=None, done_callback=None) -> dict[Path, dict]:
     """analyze() every path, reusing `cache` for files whose (mtime, size)
     haven't changed and running the rest through a thread pool (analyze()'s
     cv2/numpy calls release the GIL -- see the comments at
@@ -810,7 +810,13 @@ def analyze_paths(paths: list[Path], cache: dict,
     *progress_callback*, if given, is called as progress_callback(label,
     done, total) as each uncached item completes, instead of the default
     TTY-aware print via _print_progress -- see group_duplicates's matching
-    parameter."""
+    parameter.
+
+    *done_callback*, if given, is called as done_callback(path, result) the
+    moment each path resolves -- with the result dict, or None if it failed
+    to analyze -- so a caller can act on finished files without waiting for
+    the whole batch (build_groups uses it to publish groups incrementally).
+    It fires on this thread, not a worker's, and for cached hits too."""
     results: dict[Path, dict] = {}
     if precomputed_stats is not None:
         stats = precomputed_stats
@@ -821,7 +827,13 @@ def analyze_paths(paths: list[Path], cache: dict,
     for p in paths:
         hit = cached_result(cache, p, stats[p])
         if hit is not None:
+            # file_size is attached per result rather than in one pass at the
+            # end, so a result handed to done_callback mid-batch is already
+            # complete -- _group_detail and auto_apply_groups both read it.
+            hit["file_size"] = stats[p].st_size
             results[p] = hit
+            if done_callback is not None:
+                done_callback(p, hit)
         else:
             to_compute.append(p)
 
@@ -836,8 +848,14 @@ def analyze_paths(paths: list[Path], cache: dict,
                     zip(to_compute, executor.map(_analyze_one, [str(p) for p in to_compute])), start=1
                 ):
                     if r is not None:
+                        # After store_result (which copies): file_size tracks
+                        # the file, not the analysis, and has no business in
+                        # a cache entry keyed on it.
                         store_result(cache, p, stats[p], r)
+                        r["file_size"] = stats[p].st_size
                         results[p] = r
+                    if done_callback is not None:
+                        done_callback(p, r)
                     if progress_callback is not None:
                         progress_callback("Analyzing", done, total)
                     else:
@@ -847,19 +865,85 @@ def analyze_paths(paths: list[Path], cache: dict,
         if progress_callback is None and tty:
             print()
 
-    for p in results:
-        results[p]["file_size"] = stats[p].st_size
     return results
+
+
+def _build_group(members: list[Path], analyzed: dict[Path, dict]) -> Group | None:
+    """Assemble one finished Group from a raw cluster, or None if fewer than
+    two of its files survived analysis (it's no longer a duplicate group).
+
+    Scoring, the best-first permutation and the close-call flag all happen
+    here, so a Group is complete and correctly ordered the first time anyone
+    sees it -- see build_groups' *group_callback*, which hands groups out
+    while the scan is still running. A published group must never reorder
+    afterwards; that's what makes its indices safe to act on."""
+    valid = [(p, analyzed[p]) for p in members if p in analyzed]
+    if len(valid) < 2:
+        return None
+    paths, results = zip(*valid)
+    paths, results = list(paths), list(results)
+    score_group(results)
+
+    # Reorder the group best-first rather than just recording which index
+    # won, so the suggested file is always [1] -- leftmost column in the
+    # web table, first preview on the stage. Reviewing is a high-volume
+    # loop and the eye shouldn't have to hunt for the ★ in a different
+    # position every group. Both lists are permuted by the same order, so
+    # every index downstream (current_pick, the manifest, /api/thumb's j,
+    # the digit-key shortcuts) stays consistent -- there is no "original
+    # index" left to translate back to.
+    #
+    # sorted() is stable and find_images() returns sorted paths, so files
+    # that tie on quality_score keep filename order relative to each
+    # other; identical copies don't shuffle unpredictably between scans.
+    order = sorted(range(len(results)), key=lambda i: -results[i]["quality_score"])
+    paths = [paths[i] for i in order]
+    results = [results[i] for i in order]
+
+    # bool(...): quality_score can be a numpy float64 (propagated from
+    # analyze()'s metrics), and `<` against one produces numpy.bool_, not
+    # Python bool -- `and` returns its second operand as-is rather than
+    # coercing it, so close_call would silently end up numpy.bool_ too.
+    # That's fine for a plain truthy "if g.is_close_call" check, but
+    # numpy.bool_ (unlike numpy.float64) isn't a subclass of its Python
+    # equivalent and isn't JSON-serializable -- the web front end's
+    # /api/state was the first consumer to actually hit this.
+    close_call = bool(
+        len(results) > 1
+        and results[0]["quality_score"] - results[1]["quality_score"] < CLOSE_CALL_MARGIN
+    )
+    return Group(
+        paths=paths,
+        results=results,
+        # Not generated here: decoding+downscaling every group's images up
+        # front stalls scan completion on large scans, and groups the user
+        # never navigates to (e.g. quits early) would pay that cost for
+        # nothing. Generated lazily on first request instead (see
+        # duplicates_web._cached_render).
+        thumbnails=None,
+        suggested_idx=0,
+        current_pick=0,
+        is_close_call=close_call,
+    )
 
 
 def build_groups(
     directory: Path, threshold: int, recursive: bool = False, dest_dir: Path | None = None,
     progress_callback=None, hash_cache: dict | None = None, analyze_cache: dict | None = None,
+    group_callback=None,
 ) -> list[Group]:
     """*progress_callback*, if given, is passed straight through to
     group_duplicates/analyze_paths -- see their matching parameter. None
     (the default) preserves the CLI's existing TTY-aware stdout printing
     unchanged.
+
+    *group_callback*, if given, is called with each Group as it is finished,
+    in returned-list order, while the analyze phase is still running. Every
+    grouped file still goes through one thread pool, so total throughput is
+    unchanged -- what changes is that a caller (the web front end) can start
+    showing groups without waiting for the last one. Groups are only ever
+    appended and a published group's contents never change afterwards, which
+    is what makes its index safe to hand out mid-scan.
 
     *hash_cache*/*analyze_cache* are caller-owned and in-memory only: a scan
     writes nothing to *directory*. Passing dicts that outlive this call is
@@ -883,63 +967,48 @@ def build_groups(
     # during the hash phase (the same Path objects are reused).
     grouped_paths = [p for members in raw_groups for p in members]
     grouped_paths, grouped_stats = _stat_paths(grouped_paths)
-    analyzed = analyze_paths(
+
+    # Publish each group as soon as its own files finish analyzing, instead
+    # of after the whole analyze phase. Every grouped file is still handed to
+    # one thread pool up front, so total throughput is identical -- but a
+    # group whose files are done need not wait behind the rest of the
+    # library. analyze() costs ~8-19x what hashing one file does, so on a
+    # library with duplicates in it that wait is most of the scan.
+    #
+    # Groups are published in raw_groups order (via *cursor*), never in
+    # completion order: the index a caller acts on has to mean the same group
+    # for the life of the scan, and analyze_paths resolves files in
+    # submission order anyway, so waiting for group N before publishing N+1
+    # costs nothing in practice.
+    groups: list[Group] = []
+    kept = set(grouped_paths)
+    remaining = [sum(1 for p in members if p in kept) for members in raw_groups]
+    owner = {p: gi for gi, members in enumerate(raw_groups) for p in members if p in kept}
+    analyzed: dict[Path, dict] = {}
+    cursor = 0
+
+    def publish_ready() -> None:
+        nonlocal cursor
+        while cursor < len(raw_groups) and remaining[cursor] == 0:
+            group = _build_group(raw_groups[cursor], analyzed)
+            cursor += 1
+            if group is None:
+                continue
+            groups.append(group)
+            if group_callback is not None:
+                group_callback(group)
+
+    def on_analyzed(p: Path, result: dict | None) -> None:
+        if result is not None:
+            analyzed[p] = result
+        remaining[owner[p]] -= 1
+        publish_ready()
+
+    analyze_paths(
         grouped_paths, analyze_cache, precomputed_stats=grouped_stats,
-        progress_callback=progress_callback,
+        progress_callback=progress_callback, done_callback=on_analyzed,
     )
-
-    groups = []
-    for members in raw_groups:
-        # Skip files that failed analysis (not in analyzed dict).
-        valid = [(p, analyzed[p]) for p in members if p in analyzed]
-        if len(valid) < 2:
-            continue  # no longer a duplicate group
-        members, results = zip(*valid)
-        members = list(members)
-        results = list(results)
-        score_group(results)
-
-        # Reorder the group best-first rather than just recording which index
-        # won, so the suggested file is always [1] -- leftmost column in the
-        # web table, first preview on the stage. Reviewing is a
-        # high-volume loop and the eye shouldn't have to hunt for the ★ in a
-        # different position every group. Both lists are permuted by the same
-        # order, so every index downstream (current_pick, the manifest,
-        # /api/thumb's j, the digit-key shortcuts) stays consistent -- there
-        # is no "original index" left to translate back to.
-        #
-        # sorted() is stable and find_images() returns sorted paths, so files
-        # that tie on quality_score keep filename order relative to each
-        # other; identical copies don't shuffle unpredictably between scans.
-        order = sorted(range(len(results)), key=lambda i: -results[i]["quality_score"])
-        members = [members[i] for i in order]
-        results = [results[i] for i in order]
-        suggested_idx = 0
-        # bool(...): quality_score can be a numpy float64 (propagated from
-        # analyze()'s metrics), and `<` against one produces numpy.bool_,
-        # not Python bool -- `and` returns its second operand as-is rather
-        # than coercing it, so close_call would silently end up numpy.bool_
-        # too. That's fine for a plain truthy "if g.is_close_call" check,
-        # but numpy.bool_ (unlike numpy.float64) isn't a subclass of its
-        # Python equivalent and isn't JSON-serializable -- the web front
-        # end's /api/state was the first consumer to actually hit this.
-        close_call = bool(
-            len(results) > 1
-            and results[0]["quality_score"] - results[1]["quality_score"] < CLOSE_CALL_MARGIN
-        )
-        groups.append(
-            Group(
-                paths=members,
-                results=results,
-                # Not generated here: decoding+downscaling every group's images
-                # up front stalls scan completion on large scans, and groups the
-                # user never navigates to (e.g. quits early) would pay that
-                # cost for nothing. Generated lazily on first request instead
-                # (see duplicates_web._cached_render).
-                thumbnails=None,
-                suggested_idx=suggested_idx,
-                current_pick=suggested_idx,
-                is_close_call=close_call,
-            )
-        )
+    # Nothing calls back for a group whose every file vanished between
+    # find_images and _stat_paths, so those are flushed (and dropped) here.
+    publish_ready()
     return groups
