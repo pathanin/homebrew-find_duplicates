@@ -1,5 +1,10 @@
 # Perf analysis: answering perf-handoff.md's open questions
 
+**Status:** recommendations 1, 3 and 5 shipped (`0feec34`, `ae1b368`).
+Recommendation 2 (on-disk cache) was declined — the caches stay in memory.
+Recommendation 4 stays rejected. The measurements below are the pre-change
+baseline and still describe why each change was worth making.
+
 Follow-up to `perf-handoff.md` (the vectorized hash sweep, `e7cd9a0`). That note
 ranked four next steps. Measured on this machine (Apple M-series, 10 cores,
 numpy 2.4.5, cv2 5.0.0), the ranking is **inverted**: the sweep is finished, and
@@ -101,7 +106,11 @@ visible**. Never publish a group and reorder it afterwards; `?g=<generation>`
 covers rescans, not in-place permutation. `--auto` still analyzes every group —
 same total work, no behavior change.
 
-### 2. Bring back the on-disk cache, fixing what got it removed
+### 2. Bring back the on-disk cache, fixing what got it removed — DECLINED
+
+Kept as the record of why it looked attractive and what it would have to
+answer. The caches stay in-memory; `daf7d65`'s reasoning stands.
+
 
 Both caches die with the process, so restarting the server re-pays the entire
 scan. `daf7d65` ("Move the scan caches in-memory") removed the persistent
