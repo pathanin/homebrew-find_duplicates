@@ -40,6 +40,16 @@ except ImportError:
 # the largest images your typical scan encounters.
 EFFECTIVE_RES_MAX_PX = 2048
 
+# Probed once at import rather than per image: load_gray decodes color only
+# when brisque is actually there to use it (see load_gray). brisque_score
+# keeps its own import -- this flag decides how to *decode*, not whether the
+# score is attempted.
+try:
+    from brisque import BRISQUE as _BRISQUE_PROBE  # noqa: F401
+    _HAVE_BRISQUE = True
+except Exception:
+    _HAVE_BRISQUE = False
+
 
 def _load_bgr_via_pil(path):
     """Fallback decode for formats cv2 can't read at all (currently just
@@ -58,7 +68,15 @@ def _load_bgr_via_pil(path):
 
 
 def load_gray(path):
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    # brisque_score is the only consumer of the color image, and `brisque` is
+    # an optional import that normally isn't installed -- decoding grayscale
+    # straight from libjpeg then skips a color decode and a full-frame
+    # cvtColor (~4 ms/image, 11-15% of analyze). Not bit-identical to
+    # BGR2GRAY (libjpeg hands back Y before chroma upsampling); measured
+    # across every group in tests/Test-image the metrics move <1% at the
+    # median and no group's suggested pick changes. The HEIC path still comes
+    # back BGR either way, so those results are untouched.
+    img = cv2.imread(path, cv2.IMREAD_COLOR if _HAVE_BRISQUE else cv2.IMREAD_GRAYSCALE)
     if img is None:
         img = _load_bgr_via_pil(path)
     if img is None:
@@ -71,7 +89,7 @@ def load_gray(path):
     # every metric -- far below anything that could flip a quality_score
     # ranking, since float32 still carries ~7 decimal digits of precision
     # against inputs that are 8-bit pixel data to begin with.
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gray = (img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)).astype(np.float32)
     return img, gray
 
 
@@ -148,8 +166,12 @@ def effective_resolution(gray):
     power = _power_spectrum(gray)
 
     cy, cx = h // 2, w // 2
-    y, x = np.indices((h, w))
-    r = np.sqrt((x - cx) ** 2 + (y - cy) ** 2).astype(int)
+    # Broadcast two 1-D squared-offset arrays instead of np.indices' two full
+    # h*w int64 grids: same int64 arithmetic and same float64 sqrt, so the
+    # result is bit-identical, at ~1.7x the speed and one fewer big temporary.
+    dx2 = (np.arange(w) - cx) ** 2
+    dy2 = (np.arange(h) - cy) ** 2
+    r = np.sqrt(dx2[None, :] + dy2[:, None]).astype(np.int32)
     max_r = min(cx, cy)
 
     radial_power = np.bincount(r.ravel(), power.ravel())[:max_r]

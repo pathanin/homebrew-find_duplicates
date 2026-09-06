@@ -17,6 +17,7 @@ import shutil
 import sys
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, NamedTuple
 
@@ -317,12 +318,26 @@ class UnionFind:
             self.rank[ra] += 1
 
 
+@lru_cache(maxsize=None)
+def _cache_key(p: Path) -> str:
+    """Resolved path string, the key both scan caches use. Memoized because
+    resolve() runs 2-4 times per file per scan (a lookup and a store in each
+    of the hash and analyze caches) and is a per-path-component readlink
+    round-trip on the NAS/SMB shares this tool is built for -- ~10 us on
+    local APFS, unmeasured but plausibly far worse there. Safe to memoize
+    because it only ever produces cache keys: a symlink repointed mid-session
+    would at worst cost that file a re-hash.
+    ponytail: unbounded, one string per path seen this process -- bound it if
+    a single process ever scans enough distinct paths for that to matter."""
+    return str(p.resolve())
+
+
 def cached_hash(cache: dict, p: Path, st: os.stat_result) -> tuple[int, int] | None:
     """Returns the (grouping, confirmation) hash pair. None both when there's
     no entry and when the cached entry itself is None (the file failed to
     decode/hash last time) -- a permanently-corrupt file is simply re-attempted
     every run, no worse than today's uncached behavior for that one file."""
-    entry = cache.get(str(p.resolve()))
+    entry = cache.get(_cache_key(p))
     if entry is None or entry.get("mtime") != st.st_mtime_ns or entry.get("size") != st.st_size:
         return None
     return entry["hash"]
@@ -330,7 +345,7 @@ def cached_hash(cache: dict, p: Path, st: os.stat_result) -> tuple[int, int] | N
 
 def store_hash(cache: dict, p: Path, st: os.stat_result,
                hash_value: tuple[int, int] | None) -> None:
-    cache[str(p.resolve())] = {"mtime": st.st_mtime_ns, "size": st.st_size, "hash": hash_value}
+    cache[_cache_key(p)] = {"mtime": st.st_mtime_ns, "size": st.st_size, "hash": hash_value}
 
 
 def _stat_paths(paths: list[Path]) -> tuple[list[Path], dict[Path, os.stat_result]]:
@@ -758,7 +773,7 @@ def apply_pick(
 
 
 def cached_result(cache: dict, p: Path, st: os.stat_result) -> dict | None:
-    entry = cache.get(str(p.resolve()))
+    entry = cache.get(_cache_key(p))
     if entry is None or entry.get("mtime") != st.st_mtime_ns or entry.get("size") != st.st_size:
         return None
     try:
@@ -770,7 +785,7 @@ def cached_result(cache: dict, p: Path, st: os.stat_result) -> dict | None:
 
 
 def store_result(cache: dict, p: Path, st: os.stat_result, result: dict) -> None:
-    cache[str(p.resolve())] = {"mtime": st.st_mtime_ns, "size": st.st_size, "result": dict(result)}
+    cache[_cache_key(p)] = {"mtime": st.st_mtime_ns, "size": st.st_size, "result": dict(result)}
 
 
 def _analyze_one(path_str: str) -> dict | None:
