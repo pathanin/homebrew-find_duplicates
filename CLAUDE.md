@@ -35,6 +35,7 @@ python3 tests/test_scan_progress.py
 python3 tests/test_score_group.py
 python3 tests/test_shutdown.py
 python3 tests/test_unapply_crash_safety.py
+python3 tests/test_vectorized_sweep.py
 python3 tests/test_web_api.py
 python3 tests/test_web_progress.py
 ```
