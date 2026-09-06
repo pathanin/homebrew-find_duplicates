@@ -191,7 +191,10 @@ def _launch_scan(
 
     def on_done(fut: "asyncio.Future[list[Group]]") -> None:
         with session.lock:
-            streamed = session.streaming
+            # `stream`, not session.streaming: reading the flag back happens to
+            # agree today only because /api/scan refuses to start while one is
+            # running. Taking it from the closure keeps a rescan's on_done from
+            # silently skipping its group swap if that guard ever loosens.
             session.streaming = False
             try:
                 groups = fut.result()
@@ -199,7 +202,7 @@ def _launch_scan(
                 session.status = "error"
                 session.error = str(exc)
                 return
-            if not streamed:
+            if not stream:
                 session.params = params
                 session.groups = groups
                 session.manifest = []

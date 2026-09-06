@@ -92,6 +92,10 @@ async function refreshState() {
   return data;
 }
 
+// Which row the rail was last scrolled to, so a rebuild that doesn't change
+// the active group leaves the reviewer's own scroll position alone.
+let lastScrolledIndex = -1;
+
 // Monotonic per-call token: if group B is clicked before group A's fetch
 // resolves, A's response must not clobber B's once B has already landed.
 let loadGroupToken = 0;
@@ -140,6 +144,25 @@ function reviewCounts() {
 // full-screen progress panel would be hiding work the user can already do.
 function reviewableDuringScan() {
   return state.streaming && state.groups.length > 0;
+}
+
+// Decisions are locked while a scan could pull the groups out from under them.
+// A rescan swaps groups AND manifest wholesale in on_done, so acting on an
+// index mid-rescan moves real files and then loses the record of it (the
+// server refuses with 409 -- this keeps the UI from offering the action at
+// all). A streaming scan only ever appends, so it stays unlocked: that is the
+// entire point of it. Every decision path tests this one predicate -- pick,
+// confirm and skip each used to carry their own copy, and confirm/skip were
+// missing it.
+function decisionsLocked() {
+  return state.status === "scanning" && !state.streaming;
+}
+
+// A streaming scan is still publishing, so "no groups left" means "none so
+// far". Saying the review is finished -- and inviting the user to close the
+// tab, which drops the in-memory manifest -- would be wrong.
+function scanStillPublishing() {
+  return state.status === "scanning" && state.streaming;
 }
 
 function appState() {
@@ -198,7 +221,9 @@ function updateDocumentTitle() {
     return;
   }
   const { pending, total } = reviewCounts();
-  document.title = pending === 0 ? "Done — duplicate review" : `${pending}/${total} left — duplicate review`;
+  document.title = pending === 0 && !scanStillPublishing()
+    ? "Done — duplicate review"
+    : `${pending}/${total} left — duplicate review`;
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +265,7 @@ function renderNotices() {
     host.appendChild(notice("dry", "Dry run", "Confirm and skip update this review only. No file will be moved."));
   }
   const { confirmed, skipped, pending, total } = reviewCounts();
-  if (total && pending === 0) {
+  if (total && pending === 0 && !scanStillPublishing()) {
     host.appendChild(notice(
       "done",
       "All reviewed",
@@ -262,13 +287,7 @@ function renderQueue() {
   $("meter-kept").style.width = total ? `${(100 * confirmed) / total}%` : "0";
   $("meter-skipped").style.width = total ? `${(100 * skipped) / total}%` : "0";
   $("queue-meter").setAttribute("aria-label", `${confirmed} kept, ${skipped} skipped, ${pending} left`);
-  // While a streaming scan is still running the queue is incomplete, and the
-  // full-screen progress panel is gone as soon as the first group lands --
-  // so the tally line carries the phase readout instead of vanishing.
-  const p = state.progress;
-  $("queue-tally").textContent = state.status === "scanning" && state.streaming
-    ? `Still scanning — ${p && p.total > 0 ? `${fmtInt(p.done)} / ${fmtInt(p.total)}` : "…"}`
-    : (total ? `${confirmed} kept · ${skipped} skipped` : "");
+  renderScanTally();
 
   const list = $("queue-list");
   list.innerHTML = "";
@@ -317,8 +336,26 @@ function renderQueue() {
     list.appendChild(li);
   });
 
+  // Only when the active row actually moved. renderQueue now runs while a
+  // streaming scan publishes, and scrolling on every rebuild would drag the
+  // rail back under a reviewer trying to scroll it themselves.
   const active = list.querySelector(".is-active");
-  if (active) active.scrollIntoView({ block: "nearest", inline: "nearest" });
+  if (active && state.activeIndex !== lastScrolledIndex) {
+    lastScrolledIndex = state.activeIndex;
+    active.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+}
+
+// The queue rail's one live line during a scan. Split out of renderQueue
+// because the progress stream ticks ~5x/second: rebuilding the whole list at
+// that rate destroys keyboard focus, swallows clicks landing between mousedown
+// and mouseup, and re-runs the scroll above. Only this text has to change.
+function renderScanTally() {
+  const { confirmed, skipped, total } = reviewCounts();
+  const p = state.progress;
+  $("queue-tally").textContent = scanStillPublishing()
+    ? `Still scanning — ${p && p.total > 0 ? `${fmtInt(p.done)} / ${fmtInt(p.total)}` : "…"}`
+    : (total ? `${confirmed} kept · ${skipped} skipped` : "");
 }
 
 // ---------------------------------------------------------------------------
@@ -815,9 +852,10 @@ function renderDecision() {
 // yet". Help is never disabled: the one control that explains the app has to
 // work when there's nothing to review.
 const NO_GROUP_REASON = "Nothing to act on yet — pick a group in the list first.";
+const SCAN_LOCKED_MSG = "A scan is running — decisions are locked until it finishes.";
 
 function updateActionButtons() {
-  const hasGroup = !!state.detail && (state.status !== "scanning" || state.streaming);
+  const hasGroup = !!state.detail && !decisionsLocked();
   for (const id of ["btn-confirm", "btn-skip", "btn-open"]) {
     const btn = $(id);
     if (!btn.dataset.enabledTitle) btn.dataset.enabledTitle = btn.title;
@@ -945,7 +983,7 @@ function pick(j) {
   const i = state.activeIndex;
   const d = state.detail;
   if (i < 0 || !d || j < 0 || j >= d.paths.length) return pickChain;
-  if (state.status === "scanning" && !state.streaming) { showToast("A scan is running — decisions are locked until it finishes."); return pickChain; }
+  if (decisionsLocked()) { showToast(SCAN_LOCKED_MSG); return pickChain; }
   // A pick queued behind an in-flight confirm would race it on the wire and
   // could move files for a candidate the user never saw confirmed.
   if (confirming) { showToast("Confirming — the pick is locked until it lands."); return pickChain; }
@@ -993,6 +1031,10 @@ function pickRelative(delta) {
 async function confirmGroup() {
   const i = state.activeIndex;
   if (i < 0 || !state.detail || confirming) return;
+  // Not just the disabled button: C is a keyboard shortcut, and a keypress
+  // that silently POSTs into a rescan comes back 409 and gets reported to the
+  // user as "a rescan replaced these groups" -- which hasn't happened yet.
+  if (decisionsLocked()) { showToast(SCAN_LOCKED_MSG); return; }
   confirming = true;
   try {
     await pickChain;  // the server must be holding the pick that's on screen
@@ -1021,6 +1063,7 @@ async function confirmGroup() {
 async function skipGroup() {
   const i = state.activeIndex;
   if (i < 0 || !state.detail) return;
+  if (decisionsLocked()) { showToast(SCAN_LOCKED_MSG); return; }
   const wasConfirmed = state.detail.status === "confirmed";
   try {
     await pickChain;
@@ -1053,7 +1096,9 @@ function advance() {
       return;
     }
   }
-  showToast("That was the last one — every group is reviewed.");
+  showToast(scanStillPublishing()
+    ? "Caught up — more groups will appear as the scan finds them."
+    : "That was the last one — every group is reviewed.");
 }
 
 function stepGroup(delta) {
@@ -1119,6 +1164,10 @@ async function progressLost(es) {
   try { await refreshState(); } catch { /* the server is unreachable too */ }
   if (state.status === "scanning") {
     state.status = "error";
+    // Clear streaming with it: decisionsLocked() and the action buttons key
+    // off the pair, and a stale `true` here would keep them enabled against a
+    // scan we've lost contact with.
+    state.streaming = false;
     state.error = "Lost contact with the running scan.";
     renderNotices();
     renderAppState();
@@ -1162,20 +1211,31 @@ function connectProgress() {
     state.progress = data;
     renderProgress(data);
     if (data.status === "scanning") {
-      // A streaming scan publishes groups as it finds them; the count growing
-      // is the only signal that there is more to show. Re-read state, and
-      // open the first group as soon as one exists so the review can start
-      // without waiting for the scan to end.
-      // Not while a pick or confirm is in flight: refreshState replaces
+      // state.streaming, not just a growing count: during a RESCAN this count
+      // is the *old* group list, which is still on screen and about to be
+      // replaced wholesale. Acting on it would load a doomed group into
+      // state.detail and arm confirm/skip against groups that are going away.
+      // Only a streaming scan publishes into the live list.
+      //
+      // Not while a pick or confirm is in flight either: refreshState replaces
       // state.groups wholesale and would briefly undo the optimistic flip.
-      // lastSeenGroups isn't advanced, so the next frame retries in 0.2s.
-      if (data.groups > lastSeenGroups && !confirming && pendingPicks === 0) {
-        lastSeenGroups = data.groups;
+      if (state.streaming && data.groups > lastSeenGroups && !confirming && pendingPicks === 0) {
         refreshState()
-          .then(() => (state.detail ? null : loadFirstPending()))
-          .catch(() => { /* the terminal frame will refresh state anyway */ });
+          .then(() => {
+            // Advanced only on success -- a rejected refresh must leave the
+            // cue intact so the next frame retries it 0.2s later, rather than
+            // stranding the reviewer on a progress bar with groups waiting.
+            lastSeenGroups = data.groups;
+            // Open a group when there's nothing to act on where the reviewer
+            // is: no group yet, or the open one is already decided (they
+            // caught up with the scan and are parked on it).
+            return state.detail && state.detail.status === "pending"
+              ? null
+              : loadFirstPending();
+          })
+          .catch(() => { /* cue not consumed; the next frame retries */ });
       } else {
-        renderQueue();  // keep the tally's progress readout ticking
+        renderScanTally();  // just the readout, never a full queue rebuild
       }
       return;
     }
@@ -1187,7 +1247,18 @@ function connectProgress() {
     state.eventSource = null;
     refreshState()
       .then(loadFirstPending)
-      .catch((e) => showToast(`Scan finished, but the result didn't load: ${e.message}`, true));
+      .catch((e) => {
+        // Don't leave the UI believing a stream is still live: state.status
+        // is locally "scanning" and state.streaming stale true, which would
+        // keep decisions unlocked against a state we just failed to read.
+        state.status = "error";
+        state.streaming = false;
+        state.error = "The scan finished, but its result didn't load.";
+        renderNotices();
+        renderAppState();
+        renderQueue();
+        showToast(`Scan finished, but the result didn't load: ${e.message}`, true);
+      });
   };
 }
 

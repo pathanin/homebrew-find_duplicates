@@ -25,6 +25,7 @@ design:
    the same caches, with both on_done callbacks racing to swap groups in.
 """
 
+import json
 import sys
 import threading
 import time
@@ -69,18 +70,26 @@ def test_groups_publish_incrementally(tmp: Path) -> None:
     make_library(tmp, 6)
 
     seen: list[tuple[int, list[str]]] = []
+    analyzed_when: list[int] = []
+    done = {"n": 0}
     real_analyze = duplicates_core._analyze_one
 
-    def slow_analyze(path_str):
-        time.sleep(0.02)  # widen the window so "incremental" is observable
-        return real_analyze(path_str)
+    def counting_analyze(path_str):
+        r = real_analyze(path_str)
+        done["n"] += 1
+        return r
 
     def on_group(group):
+        # How many files had been analyzed when this group was handed over.
+        # Batching at the end would make every entry equal to the total --
+        # which is exactly what an earlier version of this test failed to
+        # notice, since comparing only the accumulated list passes either way.
+        analyzed_when.append(done["n"])
         # Snapshot the group as published; if anything reorders it later the
         # comparison against the returned list below will catch it.
         seen.append((len(seen), [p.name for p in group.paths]))
 
-    duplicates_core._analyze_one = slow_analyze
+    duplicates_core._analyze_one = counting_analyze
     try:
         groups = duplicates_core.build_groups(
             tmp, duplicates_core.DEFAULT_HASH_THRESHOLD, group_callback=on_group,
@@ -90,11 +99,17 @@ def test_groups_publish_incrementally(tmp: Path) -> None:
 
     assert len(groups) == 6, f"expected 6 groups, got {len(groups)}"
     assert len(seen) == len(groups), f"callback fired {len(seen)}x for {len(groups)} groups"
+    total_files = done["n"]
+    assert analyzed_when[0] < total_files, (
+        f"first group was published only after all {total_files} files were analyzed "
+        f"({analyzed_when[0]}) -- publication is batched at the end, not incremental"
+    )
+    assert analyzed_when == sorted(analyzed_when), f"published out of order: {analyzed_when}"
     for (i, names), group in zip(seen, groups):
         assert names == [p.name for p in group.paths], (
             f"group {i} changed after publication: {names} -> {[p.name for p in group.paths]}"
         )
-    print("ok  build_groups publishes each group once, already final")
+    print(f"ok  groups publish during the scan (first at {analyzed_when[0]}/{total_files} files), already final")
 
 
 def test_no_group_callback_is_unchanged(tmp: Path) -> None:
@@ -199,26 +214,114 @@ def test_review_works_mid_scan(tmp: Path) -> None:
     print("ok  confirm works mid-scan; rescan refused; manifest survives")
 
 
-def test_progress_stream_reports_group_count(tmp: Path) -> None:
-    """The SSE frame carries the published group count -- the frontend's only
-    cue that there is something new to show."""
-    make_library(tmp, 3)
+def test_progress_stream_reports_a_growing_group_count(tmp: Path) -> None:
+    """The SSE frame carries the published group count, and that count GROWS
+    while the scan runs -- the frontend has no other cue that there is
+    something new to show. Reading only the terminal frame would pass even if
+    the count were emitted once at the end."""
+    make_library(tmp, 6)
+
+    real_analyze = duplicates_core._analyze_one
+
+    def slow_analyze(path_str):
+        time.sleep(0.15)  # hold the scan open across several SSE frames
+        return real_analyze(path_str)
+
+    duplicates_core._analyze_one = slow_analyze
+    try:
+        with client_for(tmp) as client:
+            counts = []
+            with client.stream("GET", "/api/progress", params={"token": TOKEN}) as resp:
+                for line in resp.iter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    frame = json.loads(line[len("data:"):])
+                    assert "groups" in frame, f"progress frame has no group count: {frame}"
+                    counts.append(frame["groups"])
+                    if frame["status"] != "scanning":
+                        break
+    finally:
+        duplicates_core._analyze_one = real_analyze
+
+    assert counts, "no progress frames arrived"
+    assert counts[-1] == 6, f"final frame should report all 6 groups, got {counts[-1]}"
+    assert counts[0] < counts[-1], (
+        f"group count never grew across frames ({counts}) -- the client would "
+        "never learn there was anything to show before the scan ended"
+    )
+    print(f"ok  /api/progress reports a growing group count {counts[0]} -> {counts[-1]}")
+
+
+def test_rescan_stays_locked(tmp: Path) -> None:
+    """A rescan must NOT stream: its on_done replaces groups and manifest
+    wholesale, so a decision landing against the old indices would move files
+    and then lose the manifest entry recording it. /api/state must report
+    streaming false (every frontend lock keys off that flag) and the three
+    mutating routes must be refused.
+
+    This is the other half of test_review_works_mid_scan: that one proves
+    decisions are ALLOWED during a streaming scan, this one proves the
+    exemption didn't leak to the path it must never apply to."""
+    make_library(tmp, 6)
+
+    gate = threading.Event()
+    real_analyze = duplicates_core._analyze_one
+
     with client_for(tmp) as client:
         session = client.app.state.session
-        deadline = time.time() + 20
+        deadline = time.time() + 30
         while time.time() < deadline:
             with session.lock:
                 if session.status == "ready":
                     break
             time.sleep(0.02)
-        with client.stream("GET", "/api/progress", params={"token": TOKEN}) as resp:
-            payload = ""
-            for line in resp.iter_lines():
-                payload += line
-                if line.startswith("data:"):
+        with session.lock:
+            assert session.status == "ready", session.status
+            assert len(session.groups) == 6
+
+        # Now a rescan, held open so the mid-rescan state can be inspected.
+        def held_analyze(path_str):
+            gate.wait(timeout=10)
+            return real_analyze(path_str)
+
+        duplicates_core._analyze_one = held_analyze
+        try:
+            r = client.post(
+                "/api/scan", params={"token": TOKEN},
+                json={"directory": str(tmp), "threshold": 10},
+            )
+            assert r.status_code == 200, f"rescan should start: {r.status_code} {r.text}"
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                if session.status == "scanning":
                     break
-    assert '"groups":' in payload, f"progress frame has no group count: {payload}"
-    print("ok  /api/progress reports the group count")
+                time.sleep(0.02)
+
+            state = client.get("/api/state", params={"token": TOKEN}).json()
+            assert state["status"] == "scanning", state["status"]
+            assert state["streaming"] is False, "a rescan must never report streaming"
+            # The old groups are still listed -- that's what makes the lock
+            # necessary rather than academic.
+            assert len(state["groups"]) == 6, state["groups"]
+
+            for route, kwargs in (
+                ("/api/group/0/pick", {"json": {"idx": 1}}),
+                ("/api/group/0/confirm", {}),
+                ("/api/group/0/skip", {}),
+            ):
+                r = client.post(route, params={"token": TOKEN, "g": state["generation"]}, **kwargs)
+                assert r.status_code == 409, f"{route} mid-rescan should be 409, got {r.status_code}"
+            assert not list((tmp / "_duplicates").glob("*.jpg")), "a file moved during a locked rescan"
+        finally:
+            gate.set()
+            duplicates_core._analyze_one = real_analyze
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                with session.lock:
+                    if session.status != "scanning":
+                        break
+                time.sleep(0.02)
+    print("ok  a rescan stays locked: streaming false, pick/confirm/skip all 409")
 
 
 def main() -> int:
@@ -228,7 +331,8 @@ def main() -> int:
         test_no_group_callback_is_unchanged,
         test_file_size_present_on_a_cached_rescan,
         test_review_works_mid_scan,
-        test_progress_stream_reports_group_count,
+        test_rescan_stays_locked,
+        test_progress_stream_reports_a_growing_group_count,
     ]
     for t in tests:
         with tempfile.TemporaryDirectory() as d:
