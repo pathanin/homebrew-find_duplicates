@@ -99,6 +99,9 @@ set peaks ~80–100 MB regardless of n with the 32 MB byte budget.
 
 ## Handoff: what to analyze next
 
+**Answered — see `perf-analysis.md`. The ranking below is wrong: measured,
+`analyze()` (item 4) is the bottleneck and the sweep (items 1-2) is finished.**
+
 Ranked by expected value:
 
 1. **Is O(n²) actually a problem for the real user?** The whole use case is a
